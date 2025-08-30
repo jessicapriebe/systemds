@@ -20,10 +20,10 @@
 #-------------------------------------------------------------
 
 # Read input matrix and operator from command line args
-X = read($1);
-v = read($2);
+A = read($1);
+B = read($2);
 
 # Operation under test
-res = X %*% v;
+res = A %*% B;
 
 write(res, $3, format="binary")

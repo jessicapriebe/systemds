@@ -28,7 +28,7 @@ import org.apache.sysds.runtime.instructions.ooc.BinaryOOCInstruction;
 import org.apache.sysds.runtime.instructions.ooc.OOCInstruction;
 import org.apache.sysds.runtime.instructions.ooc.ReblockOOCInstruction;
 import org.apache.sysds.runtime.instructions.ooc.UnaryOOCInstruction;
-import org.apache.sysds.runtime.instructions.ooc.MatrixVectorBinaryOOCInstruction;
+import org.apache.sysds.runtime.instructions.ooc.BinaryMatrixMatrixOOCInstruction;
 
 public class OOCInstructionParser extends InstructionParser {
 	protected static final Log LOG = LogFactory.getLog(OOCInstructionParser.class.getName());
@@ -59,7 +59,7 @@ public class OOCInstructionParser extends InstructionParser {
 				return BinaryOOCInstruction.parseInstruction(str);
 			case AggregateBinary:
 			case MAPMM:
-				return MatrixVectorBinaryOOCInstruction.parseInstruction(str);
+				return BinaryMatrixMatrixOOCInstruction.parseInstruction(str);
 			
 			default:
 				throw new DMLRuntimeException("Invalid OOC Instruction Type: " + ooctype);

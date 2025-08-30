@@ -41,51 +41,53 @@ import org.apache.sysds.runtime.matrix.operators.BinaryOperator;
 import org.apache.sysds.runtime.matrix.operators.Operator;
 import org.apache.sysds.runtime.util.CommonThreadPool;
 
-public class MatrixVectorBinaryOOCInstruction extends ComputationOOCInstruction {
+public class BinaryMatrixMatrixOOCInstruction extends ComputationOOCInstruction {
 
 
-	protected MatrixVectorBinaryOOCInstruction(OOCType type, Operator op, CPOperand in1, CPOperand in2, CPOperand out, String opcode, String istr) {
+	protected BinaryMatrixMatrixOOCInstruction(OOCType type, Operator op, CPOperand in1, CPOperand in2, CPOperand out, String opcode, String istr) {
 		super(type, op, in1, in2, out, opcode, istr);
 	}
 
-	public static MatrixVectorBinaryOOCInstruction parseInstruction(String str) {
+	public static BinaryMatrixMatrixOOCInstruction parseInstruction(String str) {
 		String[] parts = InstructionUtils.getInstructionPartsWithValueType(str);
 		InstructionUtils.checkNumFields(parts, 4);
 		String opcode = parts[0];
 		CPOperand in1 = new CPOperand(parts[1]); // the larget matrix (streamed)
-		CPOperand in2 = new CPOperand(parts[2]); // the small vector (in-memory)
+		CPOperand in2 = new CPOperand(parts[2]); // the small matrix (in-memory)
 		CPOperand out = new CPOperand(parts[3]);
 
 		AggregateOperator agg = new AggregateOperator(0, Plus.getPlusFnObject());
 		AggregateBinaryOperator ba = new AggregateBinaryOperator(Multiply.getMultiplyFnObject(), agg);
 
-		return new MatrixVectorBinaryOOCInstruction(OOCType.MAPMM, ba, in1, in2, out, opcode, str);
+		return new BinaryMatrixMatrixOOCInstruction(OOCType.MAPMM, ba, in1, in2, out, opcode, str);
 	}
 
 	@Override
 	public void processInstruction( ExecutionContext ec ) {
 		// 1. Identify the inputs
-		MatrixObject min = ec.getMatrixObject(input1); // big matrix
-		MatrixBlock vin = ec.getMatrixObject(input2)
-			.acquireReadAndRelease(); // in-memory vector
+		MatrixObject in1 = ec.getMatrixObject(input1); // big matrix
+		MatrixBlock in2 = ec.getMatrixObject(input2)
+			.acquireReadAndRelease(); // in-memory matrix
 
-		// 2. Pre-partition the in-memory vector into a hashmap
-		HashMap<Long, MatrixBlock> partitionedVector = new HashMap<>();
-		int blksize = vin.getDataCharacteristics().getBlocksize();
+		// 2. Pre-partition the in-memory matrix into a hashmap
+		HashMap<Long, MatrixBlock> partitionedMatrix = new HashMap<>();
+		int blksize = in1.getDataCharacteristics().getBlocksize();
 		if (blksize < 0)
 			blksize = ConfigurationManager.getBlocksize();
-		for (int i=0; i<vin.getNumRows(); i+=blksize) {
-			long key = (long) (i/blksize) + 1; // the key starts at 1
-			int end_row = Math.min(i + blksize, vin.getNumRows());
-			MatrixBlock vectorSlice = vin.slice(i, end_row - 1);
-			partitionedVector.put(key, vectorSlice);
+		long cols2 = (long) Math.ceil((double) in2.getNumColumns() / blksize);
+		for (int i=0; i < in2.getNumRows(); i+=blksize) {
+			for (int j=0; j < in2.getNumColumns(); j+=blksize) {
+				long key = (long) (i/blksize) * cols2 + (long) (j/blksize);
+				MatrixBlock slice = in2.slice(i, Math.min(i + blksize, in2.getNumRows())-1, j, Math.min(j + blksize, in2.getNumColumns())-1);
+				partitionedMatrix.put(key, slice);
+			}
 		}
 
 		// number of colBlocks for early block output
-		long emissionThreshold = min.getDataCharacteristics().getNumColBlocks();
+		long emissionThreshold = in1.getDataCharacteristics().getNumColBlocks();
 		OOCMatrixBlockTracker aggTracker = new OOCMatrixBlockTracker(emissionThreshold);
 
-		LocalTaskQueue<IndexedMatrixValue> qIn = min.getStreamHandle();
+		LocalTaskQueue<IndexedMatrixValue> qIn = in1.getStreamHandle();
 		LocalTaskQueue<IndexedMatrixValue> qOut = new LocalTaskQueue<>();
 		BinaryOperator plus = InstructionUtils.parseBinaryOperator(Opcodes.PLUS.toString());
 		ec.getMatrixObject(output).setStreamHandle(qOut);
@@ -97,32 +99,40 @@ public class MatrixVectorBinaryOOCInstruction extends ComputationOOCInstruction 
 				IndexedMatrixValue tmp = null;
 				try {
 					while((tmp = qIn.dequeueTask()) != LocalTaskQueue.NO_MORE_TASKS) {
-						MatrixBlock matrixBlock = (MatrixBlock) tmp.getValue();
-						long rowIndex = tmp.getIndexes().getRowIndex();
-						long colIndex = tmp.getIndexes().getColumnIndex();
-						MatrixBlock vectorSlice = partitionedVector.get(colIndex);
+						MatrixBlock block1 = (MatrixBlock) tmp.getValue();
+						long r1 = tmp.getIndexes().getRowIndex();
+						long c1 = tmp.getIndexes().getColumnIndex();
 
-						// Now, call the operation with the correct, specific operator.
-						MatrixBlock partialResult = matrixBlock.aggregateBinaryOperations(
-							matrixBlock, vectorSlice, new MatrixBlock(), (AggregateBinaryOperator) _optr);
+						// aggregation with all corresponding blocks
+						for (int j=0; j < cols2; j++) {
+							// r2 == c1
+							long key2 = (c1-1) * cols2 + j;
+							MatrixBlock block2 = partitionedMatrix.get(key2);
 
-						// for single column block, no aggregation neeeded
-						if(emissionThreshold == 1) {
-							qOut.enqueueTask(new IndexedMatrixValue(tmp.getIndexes(), partialResult));
-						}
-						else {
-							// aggregation
-							MatrixBlock currAgg = aggTracker.get(rowIndex);
-							if (currAgg == null) {
-								aggTracker.putAndIncrementCount(rowIndex, partialResult);
+							// Now, call the operation with the correct, specific operator.
+							MatrixBlock partialResult = block1.aggregateBinaryOperations(block1, block2,
+								new MatrixBlock(), (AggregateBinaryOperator) _optr);
+
+							// for single column block, no aggregation neeeded
+							if(emissionThreshold == 1) {
+								qOut.enqueueTask(new IndexedMatrixValue(tmp.getIndexes(), partialResult));
 							}
 							else {
-								currAgg = currAgg.binaryOperations(plus, partialResult);
-								if (aggTracker.putAndIncrementCount(rowIndex, currAgg)){
-									// early block output: emit aggregated block
-									MatrixIndexes idx = new MatrixIndexes(rowIndex, 1L);
-									qOut.enqueueTask(new IndexedMatrixValue(idx, currAgg));
-									aggTracker.remove(rowIndex);
+								// index in the aggregated block: (r1, j+1)
+								long aggKey = (r1-1) * cols2 + j;
+								// aggregation
+								MatrixBlock currAgg = aggTracker.get(aggKey);
+								if(currAgg == null) {
+									aggTracker.putAndIncrementCount(aggKey, partialResult);
+								}
+								else {
+									currAgg = currAgg.binaryOperations(plus, partialResult);
+									if(aggTracker.putAndIncrementCount(aggKey, currAgg)) {
+										// early block output: emit aggregated block
+										MatrixIndexes idx = new MatrixIndexes(r1, j+1);
+										qOut.enqueueTask(new IndexedMatrixValue(idx, currAgg));
+										aggTracker.remove(aggKey);
+									}
 								}
 							}
 						}
