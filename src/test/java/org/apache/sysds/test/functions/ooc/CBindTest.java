@@ -21,6 +21,7 @@ package org.apache.sysds.test.functions.ooc;
 
 import org.apache.sysds.common.Opcodes;
 import org.apache.sysds.common.Types;
+import org.apache.sysds.parser.LanguageException;
 import org.apache.sysds.runtime.instructions.Instruction;
 import org.apache.sysds.runtime.io.MatrixWriter;
 import org.apache.sysds.runtime.io.MatrixWriterFactory;
@@ -90,11 +91,33 @@ public class CBindTest extends AutomatedTestBase {
 	@Test
 	public void testCBind() {runCBindTest(2300, 1655, 2300, 2542);}
 
+	@Test
+	public void testCBindEdgeCase1() {runCBindTest(2300, 1655, 2100, 2542);}
+
+	@Test
+	public void testCBindEdgeCase2() {runCBindTest(2100, 0, 2100, 100);}
+
+	@Test
+	public void testCBindEdgeCase3() {runCBindTest(1100, 100, 1100, 0);}
+
+	@Test
+	public void testCBindEdgeCase4() {runCBindTest(100, 100, 100, 0);}
+
+	@Test
+	public void testCBindEdgeCase5() {runCBindTest(2100, 0, 2100, 0);}
+
+	@Test
+	public void testCBindEdgeCase6() {runCBindTest(0, 100, 0, 100);}
+
+	@Test
+	public void testCBindEdgeCase7() {runCBindTest(100, 100, 100, 100);}
+
 	public void runCBindTest(int r1, int c1, int r2, int c2) {
 		Types.ExecMode platformOld = rtplatform;
 		rtplatform = Types.ExecMode.SINGLE_NODE;
 
 		try {
+			int blocksize = 1000;
 			getAndLoadTestConfiguration(TEST_NAME);
 			String HOME = SCRIPT_DIR + TEST_DIR;
 			fullDMLScriptName = HOME + TEST_NAME + ".dml";
@@ -103,18 +126,24 @@ public class CBindTest extends AutomatedTestBase {
 			double[][] B = TestUtils.floor(getRandomMatrix(r2, c2, -1, 1, 1.0, 13));
 
 			MatrixWriter writer = MatrixWriterFactory.createMatrixWriter(Types.FileFormat.BINARY);
-			writer.writeMatrixToHDFS(DataConverter.convertToMatrixBlock(A), input(INPUT_NAME_1), r1, c1, 1000, r1*c1);
-			writer.writeMatrixToHDFS(DataConverter.convertToMatrixBlock(B), input(INPUT_NAME_2), r2, c2, 1000, r2*c2);
+			writer.writeMatrixToHDFS(DataConverter.convertToMatrixBlock(A), input(INPUT_NAME_1), r1, c1, blocksize, r1*c1);
+			writer.writeMatrixToHDFS(DataConverter.convertToMatrixBlock(B), input(INPUT_NAME_2), r2, c2, blocksize, r2*c2);
 
 			HDFSTool.writeMetaDataFile(input(INPUT_NAME_1 + ".mtd"), Types.ValueType.FP64,
-				new MatrixCharacteristics(r1, c1, 1000, r1*c1), Types.FileFormat.BINARY);
+				new MatrixCharacteristics(r1, c1, blocksize, r1*c1), Types.FileFormat.BINARY);
 			HDFSTool.writeMetaDataFile(input(INPUT_NAME_2 + ".mtd"), Types.ValueType.FP64,
-				new MatrixCharacteristics(r2, c2, 1000, r2*c2), Types.FileFormat.BINARY);
+				new MatrixCharacteristics(r2, c2, blocksize, r2*c2), Types.FileFormat.BINARY);
+
 
 			programArgs = new String[] {"-explain", "-stats", "-ooc", "-args",
 				input(INPUT_NAME_1), input(INPUT_NAME_2), output(OUTPUT_NAME)};
-			runTest(true, false, null, -1);
 
+			if(r1 != r2){
+				runTest(true,true, LanguageException.class,-1);
+				return;
+			}
+
+			runTest(true, false, null, -1);
 			Assert.assertTrue("OOC wasn't used for cbind",
 				heavyHittersContainsString(Instruction.OOC_INST_PREFIX + Opcodes.APPEND));
 
@@ -125,9 +154,9 @@ public class CBindTest extends AutomatedTestBase {
 
 			// compare results
 			MatrixBlock ret1 = DataConverter.readMatrixFromHDFS(output(OUTPUT_NAME),
-				Types.FileFormat.BINARY, r1, c1+c2, 1000);
+				Types.FileFormat.BINARY, r1, c1+c2, blocksize);
 			MatrixBlock ret2 = DataConverter.readMatrixFromHDFS(output(OUTPUT_NAME + "_target"),
-				Types.FileFormat.BINARY, r1, c1+c2, 1000);
+				Types.FileFormat.BINARY, r1, c1+c2, blocksize);
 			TestUtils.compareMatrices(ret1, ret2, eps);
 		}
 		catch(Exception ex) {
