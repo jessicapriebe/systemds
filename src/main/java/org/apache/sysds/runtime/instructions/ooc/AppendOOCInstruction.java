@@ -31,12 +31,9 @@ import org.apache.sysds.runtime.matrix.data.MatrixBlock;
 import org.apache.sysds.runtime.matrix.data.MatrixIndexes;
 import org.apache.sysds.runtime.matrix.operators.Operator;
 import org.apache.sysds.runtime.matrix.operators.ReorgOperator;
-import org.apache.sysds.runtime.meta.DataCharacteristics;
-import org.apache.sysds.runtime.meta.MetaData;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 import java.util.function.Function;
 
 public class AppendOOCInstruction extends BinaryOOCInstruction {
@@ -77,7 +74,8 @@ public class AppendOOCInstruction extends BinaryOOCInstruction {
 		MatrixObject in1 = ec.getMatrixObject(input1);
 		MatrixObject in2 = ec.getMatrixObject(input2);
 		validateInput(in1, in2);
-		// if(handleZeroDims(in1, in2, ec)) return;
+		if(handleZeroDims(in1, in2, ec))
+			return;
 
 		OOCStream<IndexedMatrixValue> qIn1 = in1.getStreamHandle();
 		OOCStream<IndexedMatrixValue> qIn2 = in2.getStreamHandle();
@@ -180,16 +178,15 @@ public class AppendOOCInstruction extends BinaryOOCInstruction {
 		long rows = m1.getNumRows();
 		long cols1 = m1.getNumColumns();
 		long cols2 = m2.getNumColumns();
-		long cols = cols1+cols2;
-
-		if(rows==0){
-			// TODO:
+		if(rows == 0 || (cols1 == 0 && cols2 == 0)) {
+			OOCStream<IndexedMatrixValue> empty = createWritableStream();
+			empty.closeInput();
+			ec.getMatrixObject(output).setStreamHandle(empty);
+		}
+		else if(cols1 == 0) {
 			ec.getMatrixObject(output).setStreamHandle(m2.getStreamHandle());
 		}
-		else if(cols1==0) {
-			ec.getMatrixObject(output).setStreamHandle(m2.getStreamHandle());
-		}
-		else if(cols2==0) {
+		else if(cols2 == 0) {
 			ec.getMatrixObject(output).setStreamHandle(m1.getStreamHandle());
 		}
 		else return false;
