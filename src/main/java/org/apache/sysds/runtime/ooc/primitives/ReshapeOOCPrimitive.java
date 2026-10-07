@@ -189,14 +189,16 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 	}
 
 	private void putSliceIntoTable(MatrixBlock blk, long r, long c, int i, ReservationBudget budget) {
+		// split block into individual row or column slices and adapt indices
 		MatrixBlock slice = createSlice(blk, i);
 		long rIdx = _byRow ? (r - 1) * _blen + i + 1 : r;
 		long cIdx = _byRow ? c : (c - 1) * _blen + i + 1;
-		long targetIdx = _byRow ? (rIdx - 1) * _numColBlocksIn + c - 1 : (cIdx - 1) * _numRowBlocksIn + r - 1;
+		// compute position in row-wise or column-wise linearized order
+		long tableIdx = _byRow ? (rIdx - 1) * _numColBlocksIn + c - 1 : (cIdx - 1) * _numRowBlocksIn + r - 1;
 
 		IndexedMatrixValue sliceImv = new IndexedMatrixValue(new MatrixIndexes(rIdx, cIdx), slice);
 		budget.reserveBlocking(_sliceBytes);
-		_table.put((int) targetIdx, new ManagedPayload<>(sliceImv, _sliceBytes, budget));
+		_table.put((int) tableIdx, new ManagedPayload<>(sliceImv, _sliceBytes, budget));
 	}
 
 	private void submitSingleRowColTask() {
@@ -232,6 +234,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 
 	private void enqueueSlice(MatrixBlock blk, long r, long c, int i, ReservationBudget budget) {
 		MatrixBlock slice = createSlice(blk, i);
+		// compute output indices in row-wise or column-wise linearized order
 		long rIdx = _byRow ? 1 : ((c - 1) * _blen + i) * _numRowBlocksIn + r;
 		long cIdx = _byRow ? ((r - 1) * _blen + i) * _numColBlocksIn + c : 1;
 		IndexedMatrixValue sliceImv = new IndexedMatrixValue(new MatrixIndexes(rIdx, cIdx), slice);
@@ -248,42 +251,42 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		long outputBytes = _numRowsBlockOut * _sliceBytes + _blockBytesOut;
 		ReservationBudget budget = null;
 
-		// totalRowIdx corresponds to index of row block when all aligned in one row
-		// br * numColBlocksOut * blen + b + r * numColBlocksOut;
-		// with numColBlocksOut * blen = cols
-		long totalIdx = -_cols - 1 - _numColBlocksOut;
+		// iterate the output blocks in linearized row-major order
+		// tableIdx is the state table index of the corresponding row slice
+		// tableIdx(br,b,r) = br * cols + b + r * numColBlocksOut;
+		// where cols = numColBlocksOut * blen
 
+		long tableIdx = 0;
 		try {
 			// iterate through rows of output blocks
 			for(int br = 0; br < _numRowBlocksOut; br++) {
-				totalIdx += _cols;
-				long tmp = totalIdx;
+				long rowStart = tableIdx;
 				int localRows = (br == _numRowBlocksOut - 1 && _rows % _blen != 0) ? (int) _rows % _blen : _blen;
 
 				// for each block in row
 				for(int b = 0; b < _numColBlocksOut; b++) {
-					totalIdx += 1;
-					long tmp2 = totalIdx;
+					long blockStart = tableIdx;
 					budget = OOCUtils.reserveBudget(_allowance, outputBytes);
 
 					// for each row in block
 					for(int r = 0; r < _blen && r < localRows; r++) {
-						totalIdx += _numColBlocksOut;
-						OOCFuture<StoreLease<IndexedMatrixValue>> rowFuture = _table.take((int) totalIdx, budget);
+						OOCFuture<StoreLease<IndexedMatrixValue>> rowFuture = _table.take((int) tableIdx, budget);
 						futures.add(rowFuture);
+						tableIdx += _numColBlocksOut;
 					}
-					totalIdx = tmp2;
+					tableIdx = blockStart;
+					tableIdx += 1;
 
 					OOCFuture<List<StoreLease<IndexedMatrixValue>>> future = OOCFuture.allOf(futures, StoreLease::close);
 					MatrixIndexes idx = new MatrixIndexes(br + 1, b + 1);
 					ReservationBudget finalBudget = budget;
 
-					process(future, finalBudget,
-						leases -> processFullColBlock(idx, localRows, leases, finalBudget));
+					process(future, finalBudget, leases -> processFullColBlock(idx, localRows, leases, finalBudget));
 					futures.clear();
 					budget = null;
 				}
-				totalIdx = tmp;
+				tableIdx = rowStart;
+				tableIdx += _cols;
 			}
 		}
 		catch(IllegalStateException e) {
@@ -316,41 +319,42 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		long outputBytes = _numColsBlockOut * _sliceBytes + _blockBytesOut;
 		ReservationBudget budget = null;
 
-		// totalColIdx corresponds to index of col block when all aligned in one col
-		// bc * numRowBlocksOut * blen + b + c * numRowBlocksOut;
-		// with numRowBlocksOut * blen = rows
-		long totalIdx = -_rows - 1 - _numRowBlocksOut;
+		// iterate the output blocks in linearized column-major order
+		// tableIdx is the state table index of the corresponding column slice
+		// tableIdx(bc,b,c) = bc * rows + b + c * numRowBlocksOut,
+		// where rows = numRowBlocksOut * blen
 
+		long tableIdx = 0;
 		try {
 			// iterate through cols of output blocks
 			for(int bc = 0; bc < _numColBlocksOut; bc++) {
-				totalIdx += _rows;
-				long tmp = totalIdx;
+				long colStart = tableIdx;
 				int localCols = (bc == _numColBlocksOut - 1 && _cols % _blen != 0) ? (int) _cols % _blen : _blen;
+
 				// for each block in col
 				for(int b = 0; b < _numRowBlocksOut; b++) {
-					totalIdx += 1;
-					long tmp2 = totalIdx;
+					long blockStart = tableIdx;
 					budget = OOCUtils.reserveBudget(_allowance, outputBytes);
 
 					// for each col in block
 					for(int c = 0; c < _blen && c < localCols; c++) {
-						totalIdx += _numRowBlocksOut;
-						OOCFuture<StoreLease<IndexedMatrixValue>> colFuture = _table.take((int) totalIdx, budget);
+						OOCFuture<StoreLease<IndexedMatrixValue>> colFuture = _table.take((int) tableIdx, budget);
 						futures.add(colFuture);
+						tableIdx += _numRowBlocksOut;
 					}
-					totalIdx = tmp2;
+					tableIdx = blockStart;
+					tableIdx += 1;
 
 					OOCFuture<List<StoreLease<IndexedMatrixValue>>> future = OOCFuture.allOf(futures, StoreLease::close);
 					MatrixIndexes idx = new MatrixIndexes(b + 1, bc + 1);
 					ReservationBudget finalBudget = budget;
 
-					process(future, finalBudget,
-						leases -> processFullRowBlock(idx, localCols, leases, finalBudget));
+					process(future, finalBudget, leases -> processFullRowBlock(idx, localCols, leases, finalBudget));
 					futures.clear();
 					budget = null;
 				}
-				totalIdx = tmp;
+				tableIdx = colStart;
+				tableIdx += _rows;
 			}
 		}
 		catch(IllegalStateException e) {
@@ -397,8 +401,8 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			// iterate through input rows and add to row of output blocks
 			for(int i = 1; i <= _rlen; i++) {
 				for(int j = 1; j <= _numColBlocksIn; j++) {
-					int totalIdx = (i - 1) * _numColBlocksIn + j - 1;
-					OOCFuture<StoreLease<IndexedMatrixValue>> blkFuture = _table.take(totalIdx, budget);
+					int tableIdx = (i - 1) * _numColBlocksIn + j - 1;
+					OOCFuture<StoreLease<IndexedMatrixValue>> blkFuture = _table.take(tableIdx, budget);
 					futures.add(blkFuture);
 
 					if(futures.size() < missing)
@@ -411,7 +415,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					OOCFuture<List<StoreLease<IndexedMatrixValue>>> future = OOCFuture.allOf(futures, StoreLease::close);
 					int blockOffset = offset;
 					OOCFuture<Void> processed = process(future, finalBudget,
-						leases -> processPartialColBlocks(finalBr, finalJ, blockOffset, totalIdx, leases, finalBudget));
+						leases -> processPartialColBlocks(finalBr, finalJ, blockOffset, tableIdx, leases, finalBudget));
 
 					futures.clear();
 					budget = null;
@@ -427,7 +431,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					if(offset != 0) {
 						// get slice back from table
 						ReservationBudget nextBudget = budget;
-						blkFuture = processed.thenCompose(ignored -> _table.take(totalIdx, nextBudget));
+						blkFuture = processed.thenCompose(ignored -> _table.take(tableIdx, nextBudget));
 						futures.add(blkFuture);
 						startJ = j;
 					}
@@ -447,7 +451,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		}
 	}
 
-	private void processPartialColBlocks(int br, int j, int startOffset, int totalIdx,
+	private void processPartialColBlocks(int br, int j, int startOffset, int tableIdx,
 		List<StoreLease<IndexedMatrixValue>> leases, ReservationBudget budget) {
 
 		int offsetIn = startOffset;
@@ -509,7 +513,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			if(k == leases.size() - 1 && remainingOffset != 0) {
 				// put current slice back into table, to be able to reserve new budget
 				budget.reserveBlocking(_sliceBytes);
-				_table.put(totalIdx, new ManagedPayload<>(slice, _sliceBytes, budget));
+				_table.put(tableIdx, new ManagedPayload<>(slice, _sliceBytes, budget));
 			}
 		}
 
@@ -527,28 +531,28 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		long localColsIn = (j == _numColBlocksIn && _clen % _blen != 0) ? _clen % _blen : _blen;
 		long localRowsOut = (br == _numRowBlocksOut - 1 && _rows % _blen != 0) ? _rows % _blen : _blen;
 
-		long totalIdx = _cols * localRowsOut;
-		int cnt = 0;
+		long remaining = _cols * localRowsOut;
+		int missing = 0;
 
 		if(offsetIn != 0) {
 			// reuse table entry
-			totalIdx -= (localColsIn - offsetIn);
-			cnt++;
+			remaining -= (localColsIn - offsetIn);
+			missing++;
 		}
 
-		int numRows = (int) Math.floor((double) totalIdx / _clen);
-		cnt += numRows * _numColBlocksIn;
-		totalIdx -= numRows * _clen;
+		int numRows = (int) Math.floor((double) remaining / _clen);
+		missing += numRows * _numColBlocksIn;
+		remaining -= numRows * _clen;
 
 		long numBlenSlices = Math.max(0, _numColBlocksIn - (j - 1));
 		long restRow = numBlenSlices * _blen + localColsIn;
-		if(totalIdx - restRow > 0) {
-			totalIdx -= restRow;
-			cnt += _numColBlocksIn - j;
+		if(remaining >= restRow) {
+			remaining -= restRow;
+			missing += _numColBlocksIn - j;
 		}
-		cnt += (int) Math.ceil((double) totalIdx / _blen);
+		missing += (int) Math.ceil((double) remaining / _blen);
 
-		return cnt;
+		return missing;
 	}
 
 	private void reshapePartialRowBlocks() {
@@ -570,8 +574,8 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			// iterate through input cols and add to col of output blocks
 			for(int j = 1; j <= _clen; j++) {
 				for(int i = 1; i <= _numRowBlocksIn; i++) {
-					int totalIdx = (j - 1) * _numRowBlocksIn + i - 1;
-					OOCFuture<StoreLease<IndexedMatrixValue>> blkFuture = _table.take(totalIdx, budget);
+					int tableIdx = (j - 1) * _numRowBlocksIn + i - 1;
+					OOCFuture<StoreLease<IndexedMatrixValue>> blkFuture = _table.take(tableIdx, budget);
 					futures.add(blkFuture);
 
 					if(futures.size() < missing)
@@ -584,7 +588,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					OOCFuture<List<StoreLease<IndexedMatrixValue>>> future = OOCFuture.allOf(futures, StoreLease::close);
 					int blockOffset = offset;
 					OOCFuture<Void> processed = process(future, finalBudget,
-						leases -> processPartialRowBlocks(finalBc, finalI, blockOffset, totalIdx, leases, finalBudget));
+						leases -> processPartialRowBlocks(finalBc, finalI, blockOffset, tableIdx, leases, finalBudget));
 
 					futures.clear();
 					budget = null;
@@ -600,7 +604,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					if(offset != 0) {
 						// get slice back from table
 						ReservationBudget nextBudget = budget;
-						blkFuture = processed.thenCompose(ignored -> _table.take(totalIdx, nextBudget));
+						blkFuture = processed.thenCompose(ignored -> _table.take(tableIdx, nextBudget));
 						futures.add(blkFuture);
 						startI = i;
 					}
@@ -619,7 +623,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		}
 	}
 
-	private void processPartialRowBlocks(int bc, int i, int startOffset, int totalIdx,
+	private void processPartialRowBlocks(int bc, int i, int startOffset, int tableIdx,
 		List<StoreLease<IndexedMatrixValue>> leases, ReservationBudget budget) {
 
 		int offsetIn = startOffset;
@@ -681,7 +685,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			if(k == leases.size() - 1 && remainingOffset != 0) {
 				// put current slice back into table, to be able to reserve new budget
 				budget.reserveBlocking(_sliceBytes);
-				_table.put(totalIdx, new ManagedPayload<>(slice, _sliceBytes, budget));
+				_table.put(tableIdx, new ManagedPayload<>(slice, _sliceBytes, budget));
 			}
 		}
 
@@ -699,37 +703,40 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		long localRowsIn = (i == _numRowBlocksIn && _rlen % _blen != 0) ? _rlen % _blen : _blen;
 		long localColsOut = (bc == _numColBlocksOut - 1 && _cols % _blen != 0) ? _cols % _blen : _blen;
 
-		long totalIdx = _rows * localColsOut;
-		int cnt = 0;
+		long remaining = _rows * localColsOut;
+		int missing = 0;
 
 		if(offsetIn != 0) {
 			// reuse table entry
-			totalIdx -= (localRowsIn - offsetIn);
-			cnt++;
+			remaining -= (localRowsIn - offsetIn);
+			missing++;
 		}
 
-		int numCols = (int) Math.floor((double) totalIdx / _rlen);
-		cnt += numCols * _numRowBlocksIn;
-		totalIdx -= numCols * _rlen;
+		int numCols = (int) Math.floor((double) remaining / _rlen);
+		missing += numCols * _numRowBlocksIn;
+		remaining -= numCols * _rlen;
 
 		long numBlenSlices = Math.max(0, _numRowBlocksIn - (i - 1));
 		long restCol = numBlenSlices * _blen + localRowsIn;
-		if(totalIdx - restCol > 0) {
-			totalIdx -= restCol;
-			cnt += _numRowBlocksIn - i;
+		if(remaining >= restCol) {
+			remaining -= restCol;
+			missing += _numRowBlocksIn - i;
 		}
-		cnt += (int) Math.ceil((double) totalIdx / _blen);
+		missing += (int) Math.ceil((double) remaining / _blen);
 
-		return cnt;
+		return missing;
 	}
 
-	private MatrixBlock[] allocateSliceBlocks(int idx) {
+	private MatrixBlock[] allocateSliceBlocks(int blockGroupIdx) {
 		int n = _byRow ? _numColBlocksOut : _numRowBlocksOut;
 		MatrixBlock[] res = new MatrixBlock[n];
 
-		// full inner blocks, adjust for outer blocks
-		int localRows = ((!_byRow || idx == _numRowBlocksOut - 1) && _rows % _blen != 0) ? (int) _rows % _blen : _blen;
-		int localCols = ((_byRow || idx == _numColBlocksOut - 1) && _cols % _blen != 0) ? (int) _cols % _blen : _blen;
+		// allocate output blocks for the current block row/column
+		// adjust dimensions for the last block
+		int localRows = ((!_byRow || blockGroupIdx == _numRowBlocksOut - 1) && _rows % _blen != 0) ?
+			(int) _rows % _blen : _blen;
+		int localCols = ((_byRow || blockGroupIdx == _numColBlocksOut - 1) && _cols % _blen != 0) ?
+			(int) _cols % _blen : _blen;
 
 		for(int k = 0; k < n - 1; k++) {
 			res[k] = _byRow ? new MatrixBlock(localRows, _blen, false) : new MatrixBlock(_blen, localCols, false);
