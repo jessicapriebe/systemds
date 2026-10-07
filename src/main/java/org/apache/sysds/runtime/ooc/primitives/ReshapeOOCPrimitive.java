@@ -43,6 +43,8 @@ import org.apache.sysds.runtime.ooc.util.OOCUtils;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 public class ReshapeOOCPrimitive extends OOCPrimitive {
 	private final OOCStreamable<IndexedMatrixValue> _input;
@@ -50,6 +52,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 	private final boolean _byRow;
 	private final long _rows;
 	private final long _cols;
+	private final AtomicInteger _pending;
 
 	private long _rlen;
 	private long _clen;
@@ -77,6 +80,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 		_rows = rows;
 		_cols = cols;
 		_pattern = byRow ? OOCAccessPattern.ROW_MAJOR : OOCAccessPattern.COL_MAJOR;
+		_pending = new AtomicInteger(1);
 	}
 
 	@Override
@@ -274,7 +278,8 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					MatrixIndexes idx = new MatrixIndexes(br + 1, b + 1);
 					ReservationBudget finalBudget = budget;
 
-					future.whenComplete((leases, error) -> processFullColBlock(idx, localRows, leases, finalBudget));
+					process(future, finalBudget,
+						leases -> processFullColBlock(idx, localRows, leases, finalBudget));
 					futures.clear();
 					budget = null;
 				}
@@ -285,7 +290,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			throw new DMLRuntimeException(e);
 		}
 		finally {
-			closeResourcesAndComplete(budget);
+			cleanup(budget);
 		}
 	}
 
@@ -340,7 +345,8 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					MatrixIndexes idx = new MatrixIndexes(b + 1, bc + 1);
 					ReservationBudget finalBudget = budget;
 
-					future.whenComplete((leases, error) -> processFullRowBlock(idx, localCols, leases, finalBudget));
+					process(future, finalBudget,
+						leases -> processFullRowBlock(idx, localCols, leases, finalBudget));
 					futures.clear();
 					budget = null;
 				}
@@ -351,7 +357,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			throw new DMLRuntimeException(e);
 		}
 		finally {
-			closeResourcesAndComplete(budget);
+			cleanup(budget);
 		}
 	}
 
@@ -386,7 +392,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			budget = OOCUtils.reserveBudget(_allowance, outputBytes);
 			int missing = getNumMissingRowSlices(1, br, 0);
 			int startJ = 1;
-			final int[] offset = {0};
+			int offset = 0;
 
 			// iterate through input rows and add to row of output blocks
 			for(int i = 1; i <= _rlen; i++) {
@@ -403,8 +409,9 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					final int finalBr = br;
 
 					OOCFuture<List<StoreLease<IndexedMatrixValue>>> future = OOCFuture.allOf(futures, StoreLease::close);
-					future.whenComplete((leases, error) -> processPartialColBlocks(finalBr, finalJ, offset, totalIdx,
-						leases, finalBudget));
+					int blockOffset = offset;
+					OOCFuture<Void> processed = process(future, finalBudget,
+						leases -> processPartialColBlocks(finalBr, finalJ, blockOffset, totalIdx, leases, finalBudget));
 
 					futures.clear();
 					budget = null;
@@ -414,11 +421,13 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 
 					// new block row
 					br++;
+					offset = (int) (Math.min((long) br * _blen, _rows) * _cols % _clen % _blen);
 					budget = OOCUtils.reserveBudget(_allowance, outputBytes);
 
-					if(offset[0] != 0) {
+					if(offset != 0) {
 						// get slice back from table
-						blkFuture = _table.take(totalIdx, budget);
+						ReservationBudget nextBudget = budget;
+						blkFuture = processed.thenCompose(ignored -> _table.take(totalIdx, nextBudget));
 						futures.add(blkFuture);
 						startJ = j;
 					}
@@ -426,7 +435,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 						startJ = (j == _numColBlocksIn) ? 1 : j + 1;
 					}
 
-					missing = getNumMissingRowSlices(startJ, br, offset[0]);
+					missing = getNumMissingRowSlices(startJ, br, offset);
 				}
 			}
 		}
@@ -434,15 +443,16 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			throw new DMLRuntimeException(e);
 		}
 		finally {
-			closeResourcesAndComplete(budget);
+			cleanup(budget);
 		}
 	}
 
-	private void processPartialColBlocks(int br, int j, int[] offset, int totalIdx,
+	private void processPartialColBlocks(int br, int j, int startOffset, int totalIdx,
 		List<StoreLease<IndexedMatrixValue>> leases, ReservationBudget budget) {
 
-		int offsetIn = offset[0];
+		int offsetIn = startOffset;
 		int offsetOut = 0;
+		int remainingOffset = 0;
 		int bc = 0;
 		int r = 0;
 
@@ -482,7 +492,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					// next row
 					r++;
 					if(r == outputBlockRow[0].getNumRows()) {
-						offset[0] = offsetIn == localColsIn ? 0 : offsetIn;
+						remainingOffset = offsetIn == localColsIn ? 0 : offsetIn;
 						break;
 					}
 					bc = 0;
@@ -496,7 +506,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			lease.close();
 			offsetIn = 0;
 
-			if(k == leases.size() - 1 && offset[0] != 0) {
+			if(k == leases.size() - 1 && remainingOffset != 0) {
 				// put current slice back into table, to be able to reserve new budget
 				budget.reserveBlocking(_sliceBytes);
 				_table.put(totalIdx, new ManagedPayload<>(slice, _sliceBytes, budget));
@@ -555,7 +565,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			budget = OOCUtils.reserveBudget(_allowance, outputBytes);
 			int missing = getNumMissingColSlices(1, bc, 0);
 			int startI = 1;
-			final int[] offset = {0};
+			int offset = 0;
 
 			// iterate through input cols and add to col of output blocks
 			for(int j = 1; j <= _clen; j++) {
@@ -572,8 +582,9 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					final int finalBc = bc;
 
 					OOCFuture<List<StoreLease<IndexedMatrixValue>>> future = OOCFuture.allOf(futures, StoreLease::close);
-					future.whenComplete((leases, error) -> processPartialRowBlocks(finalBc, finalI, offset, totalIdx,
-						leases, finalBudget));
+					int blockOffset = offset;
+					OOCFuture<Void> processed = process(future, finalBudget,
+						leases -> processPartialRowBlocks(finalBc, finalI, blockOffset, totalIdx, leases, finalBudget));
 
 					futures.clear();
 					budget = null;
@@ -581,20 +592,22 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					if(bc == _numColBlocksOut - 1)
 						break;
 
-					// new block row
+					// new block col
 					bc++;
+					offset = (int) (Math.min((long) bc * _blen, _cols) * _rows % _rlen % _blen);
 					budget = OOCUtils.reserveBudget(_allowance, outputBytes);
 
-					if(offset[0] != 0) {
+					if(offset != 0) {
 						// get slice back from table
-						blkFuture = _table.take(totalIdx, budget);
+						ReservationBudget nextBudget = budget;
+						blkFuture = processed.thenCompose(ignored -> _table.take(totalIdx, nextBudget));
 						futures.add(blkFuture);
 						startI = i;
 					}
 					else {
 						startI = (i == _numRowBlocksIn) ? 1 : i + 1;
 					}
-					missing = getNumMissingColSlices(startI, bc, offset[0]);
+					missing = getNumMissingColSlices(startI, bc, offset);
 				}
 			}
 		}
@@ -602,15 +615,16 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			throw new DMLRuntimeException(e);
 		}
 		finally {
-			closeResourcesAndComplete(budget);
+			cleanup(budget);
 		}
 	}
 
-	private void processPartialRowBlocks(int bc, int i, int[] offset, int totalIdx,
+	private void processPartialRowBlocks(int bc, int i, int startOffset, int totalIdx,
 		List<StoreLease<IndexedMatrixValue>> leases, ReservationBudget budget) {
 
-		int offsetIn = offset[0];
+		int offsetIn = startOffset;
 		int offsetOut = 0;
+		int remainingOffset = 0;
 		int br = 0;
 		int c = 0;
 
@@ -650,7 +664,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 					// next col
 					c++;
 					if(c == outputBlockCol[0].getNumColumns()) {
-						offset[0] = offsetIn == localRowsIn ? 0 : offsetIn;
+						remainingOffset = offsetIn == localRowsIn ? 0 : offsetIn;
 						break;
 					}
 					br = 0;
@@ -664,7 +678,7 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			lease.close();
 			offsetIn = 0;
 
-			if(k == leases.size() - 1 && offset[0] != 0) {
+			if(k == leases.size() - 1 && remainingOffset != 0) {
 				// put current slice back into table, to be able to reserve new budget
 				budget.reserveBlocking(_sliceBytes);
 				_table.put(totalIdx, new ManagedPayload<>(slice, _sliceBytes, budget));
@@ -734,16 +748,46 @@ public class ReshapeOOCPrimitive extends OOCPrimitive {
 			((DenseBlockFP64) dest.getDenseBlock()).setPartialCol(src.getDenseBlock(), idx, srcOffset, destOffset, length);
 	}
 
-	private void closeResourcesAndComplete(ReservationBudget budget) {
-		if(budget != null) {
+	private OOCFuture<Void> process(OOCFuture<List<StoreLease<IndexedMatrixValue>>> future, ReservationBudget budget,
+		Consumer<List<StoreLease<IndexedMatrixValue>>> action) {
+		OOCFuture<Void> completion = new OOCFuture<>();
+		_pending.incrementAndGet();
+		future.whenComplete((leases, error) -> {
+			try {
+				if(error != null)
+					throw DMLRuntimeException.of(error);
+				action.accept(leases);
+				completion.complete(null);
+			}
+			catch(Throwable failure) {
+				try {
+					if(leases != null)
+						leases.forEach(StoreLease::close);
+					budget.close();
+					_out.propagateFailure(DMLRuntimeException.of(failure));
+				}
+				finally {
+					completion.completeExceptionally(failure);
+				}
+			}
+			finally {
+				cleanup(null);
+			}
+		});
+		return completion;
+	}
+
+	private void cleanup(ReservationBudget budget) {
+		if(budget != null)
 			budget.close();
-		}
-		try {
-			_table.close();
-			onComplete();
-		}
-		finally {
-			_out.closeInput();
+		if(_pending.decrementAndGet() == 0) {
+			try {
+				_table.close();
+				onComplete();
+			}
+			finally {
+				_out.closeInput();
+			}
 		}
 	}
 
